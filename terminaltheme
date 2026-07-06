@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import curses
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+
+def env_path(name: str, default: Path) -> Path:
+    return Path(os.environ.get(name, str(default))).expanduser()
+
+
+BASE_DIR = env_path(
+    "TERMINALTHEME_BASE_DIR",
+    Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/TerminalColors",
+)
+TERMINAL_DIR = env_path("TERMINALTHEME_TERMINAL_DIR", BASE_DIR / "Terminal.app")
+GHOSTTY_ARCHIVE_DIR = env_path("TERMINALTHEME_GHOSTTY_ARCHIVE_DIR", BASE_DIR / "Ghostty")
+GHOSTTY_THEMES_DIR = env_path("TERMINALTHEME_GHOSTTY_THEMES_DIR", Path.home() / ".config/ghostty/themes")
+GHOSTTY_CONFIG = env_path("TERMINALTHEME_GHOSTTY_CONFIG", Path.home() / ".config/ghostty/config")
+
+
+@dataclass
+class Theme:
+    key: str
+    display_name: str
+    terminal_file: Path | None
+    terminal_profile: str | None
+    ghostty_file: Path | None
+    background: str | None
+    foreground: str | None
+    palette: list[str]
+
+
+def title_from_key(key: str) -> str:
+    return " ".join(part.capitalize() for part in key.split("-"))
+
+
+def read_terminal_profile(path: Path) -> str | None:
+    try:
+        with path.open("rb") as f:
+            data = plistlib.load(f)
+        name = data.get("name")
+        return name if isinstance(name, str) and name.strip() else None
+    except Exception:
+        return None
+
+
+def read_ghostty_colors(path: Path) -> tuple[str | None, str | None, list[str]]:
+    background = None
+    foreground = None
+    palette: dict[int, str] = {}
+
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+
+            left, right = [part.strip() for part in line.split("=", 1)]
+            if left == "background":
+                background = right
+            elif left == "foreground":
+                foreground = right
+            elif left == "palette" and "=" in right:
+                slot, color = [part.strip() for part in right.split("=", 1)]
+                if slot.isdigit():
+                    palette[int(slot)] = color
+    except Exception:
+        pass
+
+    return background, foreground, [palette[i] for i in range(16) if i in palette]
+
+
+def load_themes() -> list[Theme]:
+    terminal_files = {path.stem: path for path in TERMINAL_DIR.glob("*.terminal")}
+    ghostty_files = {
+        path.name: path
+        for path in GHOSTTY_THEMES_DIR.iterdir()
+        if path.is_file() and path.name != "terminalcolors-manifest.txt"
+    } if GHOSTTY_THEMES_DIR.exists() else {}
+
+    keys = sorted(set(terminal_files) | set(ghostty_files))
+    themes: list[Theme] = []
+
+    for key in keys:
+        terminal_file = terminal_files.get(key)
+        ghostty_file = ghostty_files.get(key)
+        profile = read_terminal_profile(terminal_file) if terminal_file else None
+        background = None
+        foreground = None
+        palette: list[str] = []
+
+        if ghostty_file:
+            background, foreground, palette = read_ghostty_colors(ghostty_file)
+
+        themes.append(
+            Theme(
+                key=key,
+                display_name=profile or title_from_key(key),
+                terminal_file=terminal_file,
+                terminal_profile=profile,
+                ghostty_file=ghostty_file,
+                background=background,
+                foreground=foreground,
+                palette=palette,
+            )
+        )
+
+    return sorted(themes, key=lambda theme: theme.display_name.lower())
+
+
+def get_current_ghostty_theme() -> str | None:
+    if not GHOSTTY_CONFIG.exists():
+        return None
+
+    try:
+        for raw_line in GHOSTTY_CONFIG.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("#"):
+                continue
+            match = re.match(r"theme\s*=\s*(.+)", line)
+            if match:
+                return match.group(1).strip()
+    except Exception:
+        return None
+
+    return None
+
+
+def get_current_terminal_profile() -> str | None:
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "com.apple.Terminal", "Default Window Settings"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+        )
+        value = result.stdout.strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def backup_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+
+    real_path = Path(os.path.realpath(path))
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = real_path.with_name(f"{real_path.name}.terminalcolors-backup-{stamp}")
+    shutil.copy2(real_path, backup)
+    return backup
+
+
+def apply_ghostty(theme: Theme) -> str:
+    if not theme.ghostty_file:
+        raise RuntimeError("No Ghostty theme file for this theme.")
+
+    config_target = (
+        Path(os.path.realpath(GHOSTTY_CONFIG))
+        if GHOSTTY_CONFIG.exists() or GHOSTTY_CONFIG.is_symlink()
+        else GHOSTTY_CONFIG
+    )
+
+    config_target.parent.mkdir(parents=True, exist_ok=True)
+    GHOSTTY_THEMES_DIR.mkdir(parents=True, exist_ok=True)
+
+    archive_file = GHOSTTY_ARCHIVE_DIR / theme.key
+    if archive_file.exists() and not theme.ghostty_file.exists():
+        shutil.copy2(archive_file, theme.ghostty_file)
+
+    backup = backup_file(GHOSTTY_CONFIG)
+    theme_line = f"theme = {theme.key}"
+
+    if config_target.exists():
+        lines = config_target.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = []
+
+    changed = False
+    new_lines: list[str] = []
+    for line in lines:
+        if not changed and re.match(r"^\s*theme\s*=", line) and not line.lstrip().startswith("#"):
+            indent = line[: len(line) - len(line.lstrip())]
+            new_lines.append(f"{indent}{theme_line}")
+            changed = True
+        else:
+            new_lines.append(line)
+
+    if not changed:
+        insert_at = 0
+        for index, line in enumerate(new_lines):
+            if re.match(r"^\s*term\s*=", line):
+                insert_at = index + 1
+                break
+        new_lines.insert(insert_at, theme_line)
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(config_target.parent),
+            delete=False,
+        ) as f:
+            temp_path = Path(f.name)
+            f.write("\n".join(new_lines).rstrip() + "\n")
+        os.replace(temp_path, config_target)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+    backup_note = f", backup: {backup.name}" if backup else ""
+    return f"Ghostty set to {theme.key}{backup_note}"
+
+
+def applescript_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def run_osascript(script: str, timeout: int = 12) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["osascript", "-e", script],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+def terminal_profile_exists(profile_name: str) -> bool:
+    script = (
+        f"set profileName to {applescript_string(profile_name)}\n"
+        'tell application "Terminal" to exists settings set profileName'
+    )
+    result = run_osascript(script, timeout=4)
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def apply_terminal(theme: Theme) -> str:
+    if not theme.terminal_file or not theme.terminal_profile:
+        raise RuntimeError("No Terminal.app profile file for this theme.")
+
+    profile = theme.terminal_profile
+    if not terminal_profile_exists(profile):
+        subprocess.run(["open", str(theme.terminal_file)], check=True, timeout=5)
+
+    script = f"""
+set profileName to {applescript_string(profile)}
+tell application "Terminal"
+    activate
+    repeat 30 times
+        if exists settings set profileName then exit repeat
+        delay 0.2
+    end repeat
+    if not (exists settings set profileName) then error "Profile was not imported: " & profileName
+    set targetSettings to settings set profileName
+    set default settings to targetSettings
+    set startup settings to targetSettings
+    repeat with termWindow in windows
+        repeat with termTab in tabs of termWindow
+            set current settings of termTab to targetSettings
+        end repeat
+    end repeat
+end tell
+"""
+    result = run_osascript(script, timeout=12)
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout).strip()
+        raise RuntimeError(error or "Terminal.app did not accept the theme.")
+
+    return f"Terminal.app set to {profile}"
+
+
+def apply_both(theme: Theme) -> str:
+    messages = []
+    if theme.terminal_file:
+        messages.append(apply_terminal(theme))
+    if theme.ghostty_file:
+        messages.append(apply_ghostty(theme))
+    if not messages:
+        raise RuntimeError("This theme is not available for either terminal.")
+    return " | ".join(messages)
+
+
+def hex_to_rgb(color: str | None) -> tuple[int, int, int] | None:
+    if not color:
+        return None
+
+    value = color.strip()
+    if not value.startswith("#") or len(value) != 7:
+        return None
+
+    try:
+        return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16)
+    except ValueError:
+        return None
+
+
+def rgb_to_xterm256(rgb: tuple[int, int, int] | None) -> int:
+    if rgb is None:
+        return 7
+
+    r, g, b = rgb
+    if abs(r - g) < 4 and abs(g - b) < 4:
+        if r < 8:
+            return 16
+        if r > 248:
+            return 231
+        return 232 + round((r - 8) / 247 * 24)
+
+    return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+
+class Picker:
+    def __init__(self, stdscr: curses.window):
+        self.stdscr = stdscr
+        self.themes = load_themes()
+        self.selected_key = self.themes[0].key if self.themes else None
+        self.search = ""
+        self.status = "Enter: both  t: Terminal.app  g: Ghostty  /: search  r: reload  q: quit"
+        self.error = False
+        self.help_open = False
+        self.current_ghostty = get_current_ghostty_theme()
+        self.current_terminal = get_current_terminal_profile()
+
+    def filtered(self) -> list[Theme]:
+        if not self.search:
+            return self.themes
+
+        needle = self.search.lower()
+        return [
+            theme
+            for theme in self.themes
+            if needle in theme.display_name.lower() or needle in theme.key.lower()
+        ]
+
+    def selected_index(self, visible: list[Theme]) -> int:
+        if not visible:
+            return 0
+        for index, theme in enumerate(visible):
+            if theme.key == self.selected_key:
+                return index
+        self.selected_key = visible[0].key
+        return 0
+
+    def move(self, delta: int) -> None:
+        visible = self.filtered()
+        if not visible:
+            return
+        index = self.selected_index(visible)
+        self.selected_key = visible[max(0, min(len(visible) - 1, index + delta))].key
+
+    def set_status(self, message: str, error: bool = False) -> None:
+        self.status = message
+        self.error = error
+        self.current_ghostty = get_current_ghostty_theme()
+        self.current_terminal = get_current_terminal_profile()
+
+    def reload(self) -> None:
+        self.themes = load_themes()
+        if self.themes and self.selected_key not in {theme.key for theme in self.themes}:
+            self.selected_key = self.themes[0].key
+        self.set_status(f"Reloaded {len(self.themes)} themes")
+
+    def active_theme(self) -> Theme | None:
+        for theme in self.themes:
+            if theme.key == self.selected_key:
+                return theme
+        return None
+
+    def draw(self) -> None:
+        self.stdscr.erase()
+        height, width = self.stdscr.getmaxyx()
+
+        self.safe_add(0, 2, "TerminalColors Theme Picker", curses.A_BOLD)
+        self.safe_add(0, max(2, width - 30), f"{len(self.themes)} themes")
+
+        search_text = self.search if self.search else "type / to search"
+        self.safe_add(1, 2, f"Search: {search_text}"[: max(0, width - 4)], curses.A_DIM if not self.search else 0)
+
+        if self.help_open:
+            self.draw_help(height, width)
+        else:
+            self.draw_main(height, width)
+
+        status_attr = curses.A_REVERSE if self.error else curses.A_DIM
+        self.safe_add(height - 1, 0, self.status[: width - 1].ljust(width - 1), status_attr)
+        self.stdscr.refresh()
+
+    def draw_main(self, height: int, width: int) -> None:
+        visible = self.filtered()
+        index = self.selected_index(visible)
+        list_width = max(32, min(52, width // 2))
+        top = 3
+        bottom = height - 2
+        page_height = max(1, bottom - top)
+        offset = max(0, min(max(0, len(visible) - page_height), index - page_height // 2))
+
+        for row in range(page_height):
+            theme_index = offset + row
+            if theme_index >= len(visible):
+                break
+            theme = visible[theme_index]
+            marker = "TG" if theme.terminal_file and theme.ghostty_file else "T " if theme.terminal_file else " G"
+            label = f"[{marker}] {theme.display_name}"
+            attr = curses.A_REVERSE if theme_index == index else 0
+            self.safe_add(top + row, 2, label[: list_width - 4].ljust(list_width - 4), attr)
+
+        self.safe_vline(top, list_width, bottom - top)
+
+        selected = visible[index] if visible else None
+        if selected:
+            self.draw_details(selected, top, list_width + 3, bottom, width)
+        else:
+            self.safe_add(top, list_width + 3, "No themes match the search.", curses.A_BOLD)
+
+    def draw_details(self, theme: Theme, top: int, left: int, bottom: int, width: int) -> None:
+        right_width = max(10, width - left - 2)
+        y = top
+
+        self.safe_add(y, left, theme.display_name[:right_width], curses.A_BOLD)
+        y += 2
+        self.safe_add(y, left, f"ID: {theme.key}"[:right_width])
+        y += 1
+        self.safe_add(y, left, f"Terminal.app: {theme.terminal_profile or 'not available'}"[:right_width])
+        y += 1
+        self.safe_add(y, left, f"Ghostty: {theme.key if theme.ghostty_file else 'not available'}"[:right_width])
+        y += 2
+
+        terminal_mark = "yes" if self.current_terminal == theme.terminal_profile else "no"
+        ghostty_mark = "yes" if self.current_ghostty == theme.key else "no"
+        self.safe_add(y, left, f"Current in Terminal.app: {terminal_mark}"[:right_width])
+        y += 1
+        self.safe_add(y, left, f"Current in Ghostty:      {ghostty_mark}"[:right_width])
+        y += 2
+
+        self.safe_add(y, left, "Preview", curses.A_BOLD)
+        y += 1
+        if theme.background or theme.foreground:
+            self.safe_add(y, left, f"background {theme.background or '?'}  foreground {theme.foreground or '?'}"[:right_width])
+            y += 2
+
+        if theme.palette:
+            self.draw_palette(y, left, theme.palette)
+            y += 3
+        else:
+            self.safe_add(y, left, "No Ghostty palette preview available."[:right_width], curses.A_DIM)
+            y += 2
+
+        self.safe_add(y, left, "Actions", curses.A_BOLD)
+        y += 1
+        actions = [
+            "Enter  apply to both",
+            "t      apply to Terminal.app",
+            "g      apply to Ghostty",
+            "/      search",
+            "?      help",
+            "q      quit",
+        ]
+        for action in actions:
+            if y >= bottom:
+                break
+            self.safe_add(y, left, action[:right_width])
+            y += 1
+
+    def draw_palette(self, y: int, left: int, palette: list[str]) -> None:
+        if curses.has_colors():
+            for index, color in enumerate(palette[:16]):
+                pair_id = index + 1
+                try:
+                    curses.init_pair(pair_id, -1, rgb_to_xterm256(hex_to_rgb(color)))
+                    self.stdscr.addstr(y, left + index * 3, "  ", curses.color_pair(pair_id))
+                except curses.error:
+                    self.safe_add(y, left + index * 3, "[]")
+            self.safe_add(y + 1, left, " ".join(f"{i:x}" for i in range(min(16, len(palette)))))
+        else:
+            self.safe_add(y, left, " ".join(palette[:8]))
+
+    def draw_help(self, height: int, width: int) -> None:
+        lines = [
+            "Keys",
+            "",
+            "Up/Down or j/k     move selection",
+            "PageUp/PageDown    jump",
+            "/                  search",
+            "Enter or b         apply selected theme to both terminals",
+            "t                  apply only to Terminal.app",
+            "g                  apply only to Ghostty",
+            "r                  reload theme folders",
+            "?                  close help",
+            "q                  quit",
+            "",
+            "Terminal.app profiles are imported only when needed, then set as default/startup.",
+            "Ghostty updates the theme line in ~/.config/ghostty/config and writes a backup.",
+        ]
+        start_y = max(3, height // 2 - len(lines) // 2)
+        start_x = max(2, width // 2 - 40)
+        for i, line in enumerate(lines):
+            attr = curses.A_BOLD if i == 0 else 0
+            self.safe_add(start_y + i, start_x, line[: max(0, width - start_x - 2)], attr)
+
+    def prompt_search(self) -> None:
+        curses.curs_set(1)
+        curses.echo()
+        height, width = self.stdscr.getmaxyx()
+        prompt = "Search: "
+        self.safe_add(height - 1, 0, " " * (width - 1))
+        self.safe_add(height - 1, 0, prompt)
+        self.stdscr.refresh()
+        try:
+            value = self.stdscr.getstr(height - 1, len(prompt), max(1, width - len(prompt) - 2))
+            self.search = value.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+
+    def apply_selected(self, target: str) -> None:
+        theme = self.active_theme()
+        if not theme:
+            self.set_status("No theme selected", True)
+            return
+
+        try:
+            if target == "both":
+                message = apply_both(theme)
+            elif target == "terminal":
+                message = apply_terminal(theme)
+            elif target == "ghostty":
+                message = apply_ghostty(theme)
+            else:
+                raise RuntimeError("Unknown target.")
+            self.set_status(message)
+        except Exception as exc:
+            self.set_status(str(exc), True)
+
+    def run(self) -> None:
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        self.stdscr.keypad(True)
+
+        while True:
+            self.draw()
+            key = self.stdscr.getch()
+
+            if key in (ord("q"), 27):
+                return
+            if key == ord("?"):
+                self.help_open = not self.help_open
+            elif self.help_open:
+                continue
+            elif key in (curses.KEY_UP, ord("k")):
+                self.move(-1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.move(1)
+            elif key == curses.KEY_NPAGE:
+                self.move(10)
+            elif key == curses.KEY_PPAGE:
+                self.move(-10)
+            elif key in (curses.KEY_HOME, ord("h")):
+                visible = self.filtered()
+                if visible:
+                    self.selected_key = visible[0].key
+            elif key in (curses.KEY_END, ord("G")):
+                visible = self.filtered()
+                if visible:
+                    self.selected_key = visible[-1].key
+            elif key == ord("/"):
+                self.prompt_search()
+            elif key == ord("c"):
+                self.search = ""
+            elif key == ord("r"):
+                self.reload()
+            elif key in (curses.KEY_ENTER, 10, 13, ord("b")):
+                self.apply_selected("both")
+            elif key == ord("t"):
+                self.apply_selected("terminal")
+            elif key == ord("g"):
+                self.apply_selected("ghostty")
+
+    def safe_add(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        height, width = self.stdscr.getmaxyx()
+        if y < 0 or y >= height or x < 0 or x >= width:
+            return
+        try:
+            self.stdscr.addstr(y, x, text[: max(0, width - x - 1)], attr)
+        except curses.error:
+            pass
+
+    def safe_vline(self, y: int, x: int, n: int) -> None:
+        height, width = self.stdscr.getmaxyx()
+        if x < 0 or x >= width:
+            return
+        for row in range(y, min(height - 1, y + n)):
+            self.safe_add(row, x, "|", curses.A_DIM)
+
+
+def main() -> int:
+    missing = []
+    if not TERMINAL_DIR.exists():
+        missing.append(str(TERMINAL_DIR))
+    if not GHOSTTY_THEMES_DIR.exists():
+        missing.append(str(GHOSTTY_THEMES_DIR))
+
+    if missing:
+        print("Missing theme folders:")
+        for path in missing:
+            print(f"  {path}")
+        return 1
+
+    try:
+        curses.wrapper(lambda stdscr: Picker(stdscr).run())
+    except KeyboardInterrupt:
+        return 0
+    except curses.error as exc:
+        print(f"Could not start curses UI: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
