@@ -24,8 +24,15 @@ By default, `terminaltheme` looks here:
 
 ```text
 ~/Library/Mobile Documents/com~apple~CloudDocs/TerminalColors/Terminal.app
+~/Library/Mobile Documents/com~apple~CloudDocs/TerminalColors/Ghostty
 ~/.config/ghostty/themes
 ~/.config/ghostty/config
+```
+
+It also includes Ghostty's bundled themes when available:
+
+```text
+/Applications/Ghostty.app/Contents/Resources/ghostty/themes
 ```
 
 You can override those paths with:
